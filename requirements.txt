@@ -1,0 +1,4 @@
+fastapi==0.111.0
+uvicorn==0.30.0
+gunicorn==22.0.0
+openai==1.40.0
