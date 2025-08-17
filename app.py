@@ -1,28 +1,25 @@
-# app.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os, json, re
+import os, json, re, traceback
 from openai import OpenAI
 
 app = FastAPI()
 
-# let your mobile/web app call this API from any origin (simple for now)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# reads your API key from the Render env var (Settings → Environment)
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Read key once. Don't crash if missing; we'll check at request time.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# quick health check so you know it's alive
 @app.get("/")
 @app.get("/health")
 def health():
     return {"ok": True, "service": "anime-gpt-server"}
 
-# tiny helper: sometimes models wrap JSON with text; this pulls out valid JSON
 def safe_json_parse(s: str):
     if not s:
         return None
@@ -37,21 +34,25 @@ def safe_json_parse(s: str):
                 return None
         return None
 
-# MAIN ROUTE: user sends description/mood, we return 2–3 exact anime titles
 @app.post("/titles")
 def titles(body: dict):
+    # 0) validate env/key
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
+
+    # 1) read inputs
     text = (body.get("text") or "").strip()
     mood = (body.get("mood") or "").strip()
-    raw_max = body.get("max", 3)          # client can ask for 2 or 3
     try:
-        raw_max = int(raw_max)
+        raw_max = int(body.get("max", 3))
     except Exception:
         raw_max = 3
-    max_n = max(2, min(3, raw_max))       # clamp between 2 and 3
+    max_n = max(2, min(3, raw_max))  # clamp 2..3
 
     if not text and not mood:
         raise HTTPException(status_code=400, detail="text or mood required")
 
+    # 2) build prompt
     system = f"""
 You are an anime recommender. Return ONLY strict JSON with exact anime titles.
 Format: {{"titles":["Exact Title 1","Exact Title 2"]}}
@@ -64,32 +65,48 @@ Rules:
 
     user = f"Description: {text}\nMood: {mood or '(none)'}\nNeed: {max_n} titles. Return JSON now."
 
-    # 1st attempt
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}]
-    )
-    raw = (r.choices[0].message.content or "").strip()
-    data = safe_json_parse(raw)
-
-    # If model didn’t give strict JSON, retry once with a reminder
-    if not data or not isinstance(data.get("titles"), list):
-        r2 = client.chat.completions.create(
+    # 3) call OpenAI with clear error handling
+    try:
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user},
-                      {"role": "user", "content": "Return strict JSON only as specified."}]
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
         )
-        raw = (r2.choices[0].message.content or "").strip()
+        raw = (r.choices[0].message.content or "").strip()
         data = safe_json_parse(raw)
+
+        if not data or not isinstance(data.get("titles"), list):
+            # retry once
+            r2 = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                    {"role": "user", "content": "Return strict JSON only as specified."},
+                ],
+            )
+            raw = (r2.choices[0].message.content or "").strip()
+            data = safe_json_parse(raw)
+
+    except Exception as e:
+        # print full stack to server logs and return a clean error to client
+        traceback.print_exc()
+        msg = str(e)
+        # Surface common issues in a friendly way
+        if "insufficient_quota" in msg or "billing" in msg:
+            raise HTTPException(status_code=502, detail="OpenAI: insufficient quota/billing")
+        if "invalid_api_key" in msg or "Incorrect API key" in msg:
+            raise HTTPException(status_code=401, detail="OpenAI: invalid API key")
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {msg}")
 
     if not data or not isinstance(data.get("titles"), list):
         raise HTTPException(status_code=502, detail="bad_ai_json")
 
-    # clean up: trim, dedupe, and clamp to 2–3
+    # 4) clean results
     seen, titles = set(), []
     for t in data["titles"]:
         t = (t or "").strip()
