@@ -1,28 +1,29 @@
+# app.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 import os, json, re
+from openai import OpenAI
 
 app = FastAPI()
 
-# allow your Expo app / any web app to call this API
+# let your mobile/web app call this API from any origin (simple for now)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
-# OpenAI client (reads your key from Render env var)
+# reads your API key from the Render env var (Settings → Environment)
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+# quick health check so you know it's alive
 @app.get("/")
-def home():
+@app.get("/health")
+def health():
     return {"ok": True, "service": "anime-gpt-server"}
 
+# tiny helper: sometimes models wrap JSON with text; this pulls out valid JSON
 def safe_json_parse(s: str):
-    """Try to parse model output to JSON, even if it added extra text."""
     if not s:
         return None
     try:
@@ -33,19 +34,20 @@ def safe_json_parse(s: str):
             try:
                 return json.loads(m.group(0))
             except Exception:
-                pass
+                return None
         return None
 
+# MAIN ROUTE: user sends description/mood, we return 2–3 exact anime titles
 @app.post("/titles")
 def titles(body: dict):
     text = (body.get("text") or "").strip()
     mood = (body.get("mood") or "").strip()
-    raw_max = body.get("max", 2)
+    raw_max = body.get("max", 3)          # client can ask for 2 or 3
     try:
         raw_max = int(raw_max)
     except Exception:
-        raw_max = 2
-    max_n = max(2, min(3, raw_max))  # clamp 2..3
+        raw_max = 3
+    max_n = max(2, min(3, raw_max))       # clamp between 2 and 3
 
     if not text and not mood:
         raise HTTPException(status_code=400, detail="text or mood required")
@@ -62,27 +64,24 @@ Rules:
 
     user = f"Description: {text}\nMood: {mood or '(none)'}\nNeed: {max_n} titles. Return JSON now."
 
+    # 1st attempt
     r = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}]
     )
     raw = (r.choices[0].message.content or "").strip()
     data = safe_json_parse(raw)
 
+    # If model didn’t give strict JSON, retry once with a reminder
     if not data or not isinstance(data.get("titles"), list):
-        # one strict retry
         r2 = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-                {"role": "user", "content": "Return strict JSON only as specified."},
-            ],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user},
+                      {"role": "user", "content": "Return strict JSON only as specified."}]
         )
         raw = (r2.choices[0].message.content or "").strip()
         data = safe_json_parse(raw)
@@ -90,7 +89,7 @@ Rules:
     if not data or not isinstance(data.get("titles"), list):
         raise HTTPException(status_code=502, detail="bad_ai_json")
 
-    # clean + dedupe + clamp
+    # clean up: trim, dedupe, and clamp to 2–3
     seen, titles = set(), []
     for t in data["titles"]:
         t = (t or "").strip()
