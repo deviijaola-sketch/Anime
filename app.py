@@ -1,29 +1,28 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os, json, re
 from openai import OpenAI
+import os, json, re
 
 app = FastAPI()
 
-# allow cross-origin calls (so your frontend can talk to this API)
+# allow your Expo app / any web app to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-# client with your OpenAI API key from Render environment
+# OpenAI client (reads your key from Render env var)
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# simple home route
 @app.get("/")
 def home():
     return {"ok": True, "service": "anime-gpt-server"}
 
-# helper: safer JSON parse
 def safe_json_parse(s: str):
+    """Try to parse model output to JSON, even if it added extra text."""
     if not s:
         return None
     try:
@@ -34,10 +33,9 @@ def safe_json_parse(s: str):
             try:
                 return json.loads(m.group(0))
             except Exception:
-                return None
+                pass
         return None
 
-# main endpoint: get anime titles
 @app.post("/titles")
 def titles(body: dict):
     text = (body.get("text") or "").strip()
@@ -47,7 +45,7 @@ def titles(body: dict):
         raw_max = int(raw_max)
     except Exception:
         raw_max = 2
-    max_n = max(2, min(3, raw_max))  # clamp 2–3
+    max_n = max(2, min(3, raw_max))  # clamp 2..3
 
     if not text and not mood:
         raise HTTPException(status_code=400, detail="text or mood required")
@@ -67,20 +65,24 @@ Rules:
     r = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}]
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
     )
     raw = (r.choices[0].message.content or "").strip()
     data = safe_json_parse(raw)
 
     if not data or not isinstance(data.get("titles"), list):
-        # retry once
+        # one strict retry
         r2 = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user},
-                      {"role": "user", "content": "Return strict JSON only as specified."}]
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+                {"role": "user", "content": "Return strict JSON only as specified."},
+            ],
         )
         raw = (r2.choices[0].message.content or "").strip()
         data = safe_json_parse(raw)
@@ -89,8 +91,7 @@ Rules:
         raise HTTPException(status_code=502, detail="bad_ai_json")
 
     # clean + dedupe + clamp
-    seen = set()
-    titles = []
+    seen, titles = set(), []
     for t in data["titles"]:
         t = (t or "").strip()
         if t and t not in seen:
